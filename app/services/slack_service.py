@@ -9,6 +9,8 @@ from app.config.settings import settings
 from app.services.nlu_service import understand_intent
 from app.services.dialogue_service import get_next_action
 from app.services.state_service import get_state, save_state, delete_state
+from app.services.software_service import submit_software_request
+from app.services.knowledge_service import log_article_feedback
 
 # Set up logging
 logging.basicConfig(
@@ -90,12 +92,241 @@ def create_slack_app():
             reply_thread = thread_ts or message_ts
             logger.info(f"Sending response in thread: {reply_thread}")
             
-            # 发送响应
-            slack_app.client.chat_postMessage(
-                channel=channel_id,
-                text=response["response"],
-                thread_ts=reply_thread
-            )
+            # Handle specific actions returned by the dialogue manager
+            if response.get("action") == "execute_software_request":
+                # Extract necessary details
+                software_name = response.get("details", {}).get("software_name", "Unknown software")
+                logger.info(f"Executing software request: {software_name} for user {user_id}")
+                
+                # Call the software service to submit the request
+                action_result = submit_software_request(user_id, software_name)
+                
+                # Update the response based on the action result
+                if action_result.get("status") == "success":
+                    ticket_number = action_result.get("ticket_number", "Unknown")
+                    response["response"] = f"Your request for {software_name} has been submitted successfully. Ticket {ticket_number} has been created to track your request."
+                    if action_result.get("simulated"):
+                        response["response"] += " (Note: This is a simulated response)"
+                else:
+                    # Handle error case
+                    error_message = action_result.get("message", "Unknown error")
+                    response["response"] = f"I'm sorry, there was an issue processing your software request: {error_message}"
+                
+                # Clear the state as determined by the dialogue manager
+                response["next_state"] = None
+            
+            # Check if response requires Block Kit buttons for password reset
+            if response.get("response_type") == "blocks" and response.get("blocks_config", {}).get("type") == "confirm_password_reset":
+                # Extract the confirmation text
+                confirmation_text = response.get("blocks_config", {}).get("text", "Would you like to proceed with the password reset?")
+                
+                # Generate Block Kit JSON
+                blocks = [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": confirmation_text
+                        }
+                    },
+                    {
+                        "type": "actions",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "text": {
+                                    "type": "plain_text",
+                                    "text": "Yes",
+                                    "emoji": True
+                                },
+                                "style": "primary",
+                                "value": "proceed",
+                                "action_id": "confirm_password_reset_yes"
+                            },
+                            {
+                                "type": "button",
+                                "text": {
+                                    "type": "plain_text",
+                                    "text": "No",
+                                    "emoji": True
+                                },
+                                "style": "danger",
+                                "value": "cancel",
+                                "action_id": "confirm_password_reset_no"
+                            }
+                        ]
+                    }
+                ]
+                
+                # Send response with Block Kit
+                slack_app.client.chat_postMessage(
+                    channel=channel_id,
+                    blocks=blocks,
+                    text=response.get("response", "Would you like to proceed with the password reset?"),  # Fallback text
+                    thread_ts=reply_thread
+                )
+            
+            # Check if response requires KB article blocks
+            elif response.get("response_type") == "blocks" and response.get("blocks_config", {}).get("type") == "kb_results":
+                # Extract articles and query
+                articles = response.get("blocks_config", {}).get("articles", [])
+                query = response.get("blocks_config", {}).get("query", "your search")
+                
+                # Create blocks for the KB articles
+                blocks = [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"*Here are some articles I found about '{query}'*:"
+                        }
+                    }
+                ]
+                
+                # Add each article with dividers and feedback buttons
+                for article in articles:
+                    # Add divider before each article (except the first one to avoid double dividers)
+                    if len(blocks) > 1:
+                        blocks.append({"type": "divider"})
+                    
+                    # Add article section with title as link
+                    blocks.append({
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"*<{article.get('url')}|{article.get('title')}>*\n{article.get('summary', 'No summary available')}"
+                        }
+                    })
+                    
+                    # Add feedback buttons for this article
+                    blocks.append({
+                        "type": "actions",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "text": {
+                                    "type": "plain_text",
+                                    "text": "✅ This Helped",
+                                    "emoji": True
+                                },
+                                "style": "primary",
+                                "value": article.get("id", "unknown"),
+                                "action_id": "kb_feedback_helpful"
+                            },
+                            {
+                                "type": "button",
+                                "text": {
+                                    "type": "plain_text",
+                                    "text": "❌ Didn't Help",
+                                    "emoji": True
+                                },
+                                "value": article.get("id", "unknown"),
+                                "action_id": "kb_feedback_unhelpful"
+                            }
+                        ]
+                    })
+                
+                # Add a final divider
+                blocks.append({"type": "divider"})
+                
+                # Add a context note
+                blocks.append({
+                    "type": "context",
+                    "elements": [
+                        {
+                            "type": "mrkdwn",
+                            "text": "If none of these articles address your issue, you can create a support ticket by saying *\"I need help with...\"*"
+                        }
+                    ]
+                })
+                
+                # Send response with Block Kit
+                slack_app.client.chat_postMessage(
+                    channel=channel_id,
+                    blocks=blocks,
+                    text=response.get("response", f"Here are some articles about {query}."),  # Fallback text
+                    thread_ts=reply_thread
+                )
+            
+            # Check if response requires urgency selection dropdown
+            elif response.get("response_type") == "blocks" and response.get("blocks_config", {}).get("type") == "select_urgency":
+                # Extract the text
+                instruction_text = response.get("blocks_config", {}).get("text", "Please select the urgency level for your ticket:")
+                
+                # Generate Block Kit JSON for the dropdown
+                blocks = [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": instruction_text
+                        }
+                    },
+                    {
+                        "type": "actions",
+                        "elements": [
+                            {
+                                "type": "static_select",
+                                "placeholder": {
+                                    "type": "plain_text",
+                                    "text": "Select urgency...",
+                                    "emoji": True
+                                },
+                                "options": [
+                                    {
+                                        "text": {
+                                            "type": "plain_text",
+                                            "text": "🔴 High - Critical business impact",
+                                            "emoji": True
+                                        },
+                                        "value": "1"
+                                    },
+                                    {
+                                        "text": {
+                                            "type": "plain_text",
+                                            "text": "🟠 Medium - Limited business impact",
+                                            "emoji": True
+                                        },
+                                        "value": "2"
+                                    },
+                                    {
+                                        "text": {
+                                            "type": "plain_text",
+                                            "text": "🟢 Low - Minimal business impact",
+                                            "emoji": True
+                                        },
+                                        "value": "3"
+                                    }
+                                ],
+                                "action_id": "select_ticket_urgency"
+                            }
+                        ]
+                    },
+                    {
+                        "type": "context",
+                        "elements": [
+                            {
+                                "type": "mrkdwn",
+                                "text": "The urgency level helps us prioritize your ticket appropriately."
+                            }
+                        ]
+                    }
+                ]
+                
+                # Send response with Block Kit
+                slack_app.client.chat_postMessage(
+                    channel=channel_id,
+                    blocks=blocks,
+                    text=response.get("response", "Please select the urgency level for your ticket."),  # Fallback text
+                    thread_ts=reply_thread
+                )
+            else:
+                # Send regular text response
+                slack_app.client.chat_postMessage(
+                    channel=channel_id,
+                    text=response["response"],
+                    thread_ts=reply_thread
+                )
             
             # 更新对话状态 - 使用Redis
             if response.get("next_state") is not None:
@@ -125,6 +356,245 @@ def create_slack_app():
                 channel=channel_id,
                 text="抱歉，处理您的请求时出现了错误。",
                 thread_ts=thread_ts or message_ts
+            )
+    
+    # Add action handler for urgency selection dropdown
+    @slack_app.action("select_ticket_urgency")
+    def handle_urgency_selection(ack, body, client):
+        """Handle urgency selection for ticket creation"""
+        # Acknowledge the action right away
+        ack()
+        
+        # Extract details from the interaction
+        user_id = body["user"]["id"]
+        channel_id = body["channel"]["id"]
+        message_ts = body["container"]["message_ts"]
+        
+        # Get the selected option value
+        selected_option = body["actions"][0]["selected_option"]["value"]
+        selected_text = body["actions"][0]["selected_option"]["text"]["text"]
+        
+        logger.info(f"User {user_id} selected ticket urgency: {selected_option} ({selected_text})")
+        
+        try:
+            # Get the current state
+            current_state = get_state(user_id, channel_id) or {}
+            
+            # Process the selection through the dialogue service
+            intent_data = {
+                "intent": "create_ticket",
+                "text": "",
+                "selected_option": selected_option
+            }
+            
+            # Call dialogue service with the selected option
+            result = handle_urgency_selection(intent_data, current_state) if "handle_urgency_selection" in globals() else get_next_action(intent_data, current_state)
+            
+            # Update the original message to show the selection
+            client.chat_update(
+                channel=channel_id,
+                ts=message_ts,
+                text=f"Ticket urgency set to: {selected_text}",
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"✅ *Urgency selected*: {selected_text}"
+                        }
+                    }
+                ]
+            )
+            
+            # Send a follow-up message asking for details
+            client.chat_postMessage(
+                channel=channel_id,
+                text=result.get("response", "Please describe the issue you're experiencing in detail."),
+                thread_ts=message_ts
+            )
+            
+            # Update the conversation state
+            if result.get("next_state") is not None:
+                save_state(user_id, channel_id, result["next_state"], ttl_seconds=900)
+                logger.info(f"Updated state: {result['next_state']}")
+            else:
+                delete_state(user_id, channel_id)
+                logger.info("Cleared conversation state")
+                
+        except Exception as e:
+            logger.error(f"Error handling urgency selection: {str(e)}", exc_info=True)
+            client.chat_postMessage(
+                channel=channel_id,
+                text="I encountered an error processing your selection. Please try again or create a ticket by describing your issue.",
+                thread_ts=message_ts
+            )
+    
+    # Add action handlers for password reset button clicks
+    @slack_app.action("confirm_password_reset_yes")
+    def handle_password_reset_yes(ack, body, client):
+        """Handle 'Yes' button click for password reset confirmation"""
+        # Acknowledge the action
+        ack()
+        
+        # Extract details from the interaction
+        user_id = body["user"]["id"]
+        channel_id = body["channel"]["id"]
+        message_ts = body["container"]["message_ts"]
+        
+        logger.info(f"User {user_id} confirmed password reset")
+        
+        try:
+            # Update the state
+            new_state = {"intent": "password_reset", "waiting_for": "employee_id"}
+            save_state(user_id, channel_id, new_state, ttl_seconds=900)
+            
+            # Send follow-up message
+            client.chat_postMessage(
+                channel=channel_id,
+                text="Great! Please provide your employee ID or username to proceed with the password reset.",
+                thread_ts=message_ts
+            )
+            
+            # Update the original message to show it's been acted upon
+            client.chat_update(
+                channel=channel_id,
+                ts=message_ts,
+                text="Password reset confirmed. Proceeding with the reset process.",
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "✅ *Password Reset Initiated*\nPlease provide your employee ID or username."
+                        }
+                    }
+                ]
+            )
+        except Exception as e:
+            logger.error(f"Error handling password reset confirmation: {str(e)}", exc_info=True)
+            client.chat_postMessage(
+                channel=channel_id,
+                text="Sorry, there was an error processing your request. Please try again.",
+                thread_ts=message_ts
+            )
+    
+    @slack_app.action("confirm_password_reset_no")
+    def handle_password_reset_no(ack, body, client):
+        """Handle 'No' button click for password reset confirmation"""
+        # Acknowledge the action
+        ack()
+        
+        # Extract details from the interaction
+        user_id = body["user"]["id"]
+        channel_id = body["channel"]["id"]
+        message_ts = body["container"]["message_ts"]
+        
+        logger.info(f"User {user_id} declined password reset")
+        
+        try:
+            # Clear the state
+            delete_state(user_id, channel_id)
+            
+            # Send follow-up message
+            client.chat_postMessage(
+                channel=channel_id,
+                text="I've cancelled the password reset. Is there anything else I can help you with?",
+                thread_ts=message_ts
+            )
+            
+            # Update the original message to show it's been acted upon
+            client.chat_update(
+                channel=channel_id,
+                ts=message_ts,
+                text="Password reset cancelled.",
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "❌ *Password Reset Cancelled*\nNo action has been taken."
+                        }
+                    }
+                ]
+            )
+        except Exception as e:
+            logger.error(f"Error handling password reset cancellation: {str(e)}", exc_info=True)
+            client.chat_postMessage(
+                channel=channel_id,
+                text="Sorry, there was an error processing your request. Please try again.",
+                thread_ts=message_ts
+            )
+    
+    # Add action handlers for KB article feedback
+    @slack_app.action("kb_feedback_helpful")
+    def handle_kb_feedback_helpful(ack, body, client):
+        """Handle helpful feedback for KB articles"""
+        # Acknowledge the action
+        ack()
+        
+        # Extract details from the interaction
+        user_id = body["user"]["id"]
+        channel_id = body["channel"]["id"]
+        message_ts = body["container"]["message_ts"]
+        article_id = body["actions"][0]["value"]
+        
+        logger.info(f"User {user_id} found article {article_id} helpful")
+        
+        try:
+            # Log the feedback
+            log_article_feedback(article_id, "helpful", user_id)
+            
+            # Send a confirmation message
+            client.chat_postMessage(
+                channel=channel_id,
+                text=f"Thank you for your feedback! I'm glad the article was helpful.",
+                thread_ts=message_ts
+            )
+            
+            # Update the button section to show it was clicked
+            # Note: We need to update the specific button section, not the entire message
+            # This would require more complex handling and knowledge of the message structure
+            # For simplicity, we'll just add a new message confirming receipt of feedback
+        except Exception as e:
+            logger.error(f"Error logging helpful feedback: {str(e)}", exc_info=True)
+            client.chat_postMessage(
+                channel=channel_id,
+                text="There was an error recording your feedback, but thank you for letting us know the article was helpful.",
+                thread_ts=message_ts
+            )
+    
+    @slack_app.action("kb_feedback_unhelpful")
+    def handle_kb_feedback_unhelpful(ack, body, client):
+        """Handle unhelpful feedback for KB articles"""
+        # Acknowledge the action
+        ack()
+        
+        # Extract details from the interaction
+        user_id = body["user"]["id"]
+        channel_id = body["channel"]["id"]
+        message_ts = body["container"]["message_ts"]
+        article_id = body["actions"][0]["value"]
+        
+        logger.info(f"User {user_id} found article {article_id} unhelpful")
+        
+        try:
+            # Log the feedback
+            log_article_feedback(article_id, "unhelpful", user_id)
+            
+            # Send a confirmation message with next steps
+            client.chat_postMessage(
+                channel=channel_id,
+                text=f"Thank you for your feedback. I'm sorry the article wasn't helpful. Would you like to create a support ticket instead?",
+                thread_ts=message_ts
+            )
+            
+            # Similar note about updating buttons applies here
+        except Exception as e:
+            logger.error(f"Error logging unhelpful feedback: {str(e)}", exc_info=True)
+            client.chat_postMessage(
+                channel=channel_id,
+                text="There was an error recording your feedback, but I understand the article wasn't helpful. Would you like to try a different search or create a support ticket?",
+                thread_ts=message_ts
             )
     
     @slack_app.event("app_mention")
