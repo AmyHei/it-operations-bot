@@ -26,6 +26,7 @@ wheels/
 env/
 venv/
 ENV/
+.itenv/
 
 # IDE
 .idea/
@@ -38,3 +39,13 @@ ENV/
 
 # Local development
 .DS_Store test_socket.py
+
+# Exported data files
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
+
+# Backup files
+*.bak
+*~

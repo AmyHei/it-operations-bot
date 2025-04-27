@@ -9,7 +9,8 @@ import logging
 import os
 import json
 import redis
-from typing import Dict, Optional, Union
+import time
+from typing import Dict, Optional, Union, List
 from dotenv import load_dotenv
 
 # Set up logging
@@ -100,7 +101,7 @@ def save_state(user_id: str, channel_id: str, state_data: Dict, ttl_seconds: int
     except redis.RedisError as e:
         logger.error(f"Redis error while saving state: {str(e)}")
         return False
-    except json.JSONEncodeError as e:
+    except json.JSONDecodeError as e:
         logger.error(f"JSON encoding error while saving state: {str(e)}")
         return False
     except Exception as e:
@@ -233,4 +234,124 @@ def update_ttl(user_id: str, channel_id: str, ttl_seconds: int = 900) -> bool:
         return False
     except Exception as e:
         logger.error(f"Unexpected error updating TTL: {str(e)}")
-        return False 
+        return False
+
+def save_conversation(user_id: str, channel_id: str, message_data: Dict, ttl_days: int = 30) -> bool:
+    """
+    Save conversation messages to Redis for evaluation purposes with a longer TTL.
+    
+    Args:
+        user_id: The user's identifier
+        channel_id: The channel or conversation identifier
+        message_data: Dictionary containing message details
+        ttl_days: Time to live in days (default: 30 days)
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    if not redis_client:
+        logger.warning("Redis client not available, conversation will not be saved")
+        return False
+        
+    if not user_id or not channel_id:
+        logger.error("Invalid user_id or channel_id provided")
+        return False
+    
+    try:
+        # Generate conversation ID (conversation:userId:channelId)
+        conversation_key = f"conversation:{user_id}:{channel_id}"
+        
+        # Generate unique message ID with timestamp
+        timestamp = message_data.get("ts", str(time.time()))
+        message_id = f"{timestamp}"
+        
+        # Convert message data to JSON string
+        message_json = json.dumps(message_data)
+        
+        # Store in Redis hash with conversation key
+        # Each message is stored with its timestamp as field
+        result = redis_client.hset(conversation_key, message_id, message_json)
+        
+        # Set expiration (convert days to seconds)
+        ttl_seconds = ttl_days * 24 * 60 * 60
+        redis_client.expire(conversation_key, ttl_seconds)
+        
+        logger.debug(f"Conversation message saved for user {user_id} in channel {channel_id}")
+        return True
+            
+    except redis.RedisError as e:
+        logger.error(f"Redis error while saving conversation: {str(e)}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error saving conversation: {str(e)}")
+        return False
+
+def get_conversation(user_id: str, channel_id: str) -> Optional[List[Dict]]:
+    """
+    Retrieve all messages from a conversation.
+    
+    Args:
+        user_id: The user's identifier
+        channel_id: The channel or conversation identifier
+        
+    Returns:
+        List of message dictionaries sorted by timestamp
+    """
+    if not redis_client:
+        logger.warning("Redis client not available, cannot retrieve conversation")
+        return None
+        
+    try:
+        # Generate conversation key
+        conversation_key = f"conversation:{user_id}:{channel_id}"
+        
+        # Get all messages from the hash
+        messages_dict = redis_client.hgetall(conversation_key)
+        
+        if not messages_dict:
+            return []
+            
+        # Parse JSON strings back to dictionaries
+        messages = []
+        for ts, message_json in messages_dict.items():
+            try:
+                message = json.loads(message_json)
+                message["ts"] = ts  # Ensure timestamp is included
+                messages.append(message)
+            except json.JSONDecodeError:
+                logger.warning(f"Failed to decode message: {message_json}")
+                
+        # Sort messages by timestamp
+        messages.sort(key=lambda m: float(m.get("ts", 0)))
+        
+        return messages
+        
+    except redis.RedisError as e:
+        logger.error(f"Redis error while retrieving conversation: {str(e)}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error retrieving conversation: {str(e)}")
+        return None
+
+def list_conversations() -> List[str]:
+    """
+    List all conversation keys in Redis.
+    
+    Returns:
+        List of conversation keys
+    """
+    if not redis_client:
+        logger.warning("Redis client not available, cannot list conversations")
+        return []
+        
+    try:
+        # Find all conversation keys
+        conversation_keys = redis_client.keys("conversation:*")
+        return conversation_keys
+        
+    except redis.RedisError as e:
+        logger.error(f"Redis error while listing conversations: {str(e)}")
+        return []
+    except Exception as e:
+        logger.error(f"Unexpected error listing conversations: {str(e)}")
+        return [] 
