@@ -49,3 +49,8 @@ ENV/
 # Backup files
 *.bak
 *~
+
+# New additions
+chroma_db_store/
+local_kb_docs/
+ngrok
