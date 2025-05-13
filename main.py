@@ -4,9 +4,17 @@ Main entry point for the application.
 import uvicorn
 import os
 from dotenv import load_dotenv
+from aiohttp import web
 
 # Load environment variables
 load_dotenv()
+
+async def options_handler(request):
+    return web.Response(status=200, headers={
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "*"
+    })
 
 if __name__ == "__main__":
     # Get configuration from environment or use defaults

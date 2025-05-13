@@ -169,7 +169,7 @@ class ServiceNowService:
         self.pwd = SERVICENOW_PASSWORD
         self.base_url = f'https://{self.instance}.service-now.com/api/now'
         
-    def _make_request(self, method: str, endpoint: str, data: Optional[Dict] = None) -> Dict:
+    def _make_request(self, method: str, endpoint: str, data: Optional[Dict] = None, params: Optional[Dict] = None) -> Dict:
         """Make a request to ServiceNow API"""
         url = f"{self.base_url}/{endpoint}"
         headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
@@ -181,6 +181,7 @@ class ServiceNowService:
                 auth=(self.user, self.pwd),
                 headers=headers,
                 json=data,
+                params=params,
                 timeout=10  # Add timeout parameter
             )
             response.raise_for_status()
@@ -340,11 +341,146 @@ class ServiceNowService:
         return self._make_request('PUT', f'table/incident/{sys_id}', updates)
 
     def get_incidents(self, limit: int = 10, query: str = '') -> List[Dict]:
-        """Get multiple incidents"""
+        """Get list of incidents"""
         endpoint = f'table/incident?sysparm_limit={limit}'
         if query:
             endpoint += f'&sysparm_query={query}'
         return self._make_request('GET', endpoint)
+
+    def search_kb_articles(self, query: str, limit: int = 3) -> Dict:
+        """
+        Search Knowledge Base articles using the ServiceNow Knowledge Management API.
+        
+        Args:
+            query: Search query string
+            limit: Maximum number of articles to return (default: 3)
+            
+        Returns:
+            Dictionary containing status and list of matching articles
+        """
+        logger.info(f"Searching Knowledge Base for: {query}")
+        
+        try:
+            # URL encode the query properly
+            encoded_query = quote(query, safe='')
+            
+            # Build the API URL for Knowledge Management API
+            endpoint = 'table/kb_knowledge'  # Use the table API instead
+            params = {
+                'sysparm_query': f'short_descriptionLIKE{encoded_query}^ORtextLIKE{encoded_query}',
+                'sysparm_limit': limit,
+                'sysparm_fields': 'sys_id,number,short_description,text'
+            }
+            
+            # Make the API request using existing _make_request method
+            data = self._make_request('GET', endpoint, params=params)
+            logger.debug(f"Received API response: {data}")
+            
+            # Check if we have results
+            if 'result' in data and isinstance(data['result'], list):
+                articles = data['result']
+                
+                # Format the articles for return
+                formatted_articles = []
+                for article in articles:
+                    try:
+                        formatted_article = {
+                            'sys_id': article.get('sys_id', ''),
+                            'number': article.get('number', ''),
+                            'short_description': article.get('short_description', ''),
+                            'text': article.get('text', ''),
+                            'score': 1.0  # Default score since we're not using the KB API
+                        }
+                        formatted_articles.append(formatted_article)
+                    except Exception as e:
+                        logger.error(f"Error formatting article: {str(e)}")
+                        continue
+                
+                return {
+                    "status": "success",
+                    "articles": formatted_articles,
+                    "message": None
+                }
+            else:
+                logger.info(f"No Knowledge Base articles found for query: {query}")
+                return {
+                    "status": "success",
+                    "articles": [],
+                    "message": "No articles found"
+                }
+                
+        except Exception as e:
+            logger.error(f"Error searching Knowledge Base: {str(e)}", exc_info=True)
+            return {
+                "status": "error",
+                "articles": [],  # Always return an articles list, even if empty
+                "message": str(e)
+            }
+
+    def get_kb_article_content(self, sys_id: str) -> Dict:
+        """
+        Retrieve detailed content of a specific Knowledge Base article.
+        
+        Args:
+            sys_id: The sys_id of the Knowledge Base article to retrieve
+            
+        Returns:
+            Dictionary containing the article content and metadata or error information
+        """
+        logger.info(f"Fetching Knowledge Base article content for sys_id: {sys_id}")
+        
+        try:
+            # Build the API URL using the Table API
+            endpoint = f'table/kb_knowledge/{sys_id}'
+            params = {
+                'sysparm_fields': 'sys_id,number,short_description,text,article_body,published,author,sys_created_on,sys_updated_on'
+            }
+            
+            # Make the API request using the existing _make_request method
+            data = self._make_request('GET', endpoint)
+            
+            # Check if we have a result
+            if 'result' in data:
+                article = data['result']
+                
+                # Get the content from either text or article_body field
+                content = article.get('article_body') or article.get('text', '')
+                
+                return {
+                    "status": "success",
+                    "article": {
+                        "sys_id": article.get('sys_id'),
+                        "number": article.get('number'),
+                        "short_description": article.get('short_description'),
+                        "content": content,
+                        "published": article.get('published'),
+                        "author": article.get('author'),
+                        "created_on": article.get('sys_created_on'),
+                        "updated_on": article.get('sys_updated_on')
+                    }
+                }
+            else:
+                logger.warning(f"Article not found with sys_id: {sys_id}")
+                return {"status": "not_found"}
+                
+        except requests.exceptions.RequestException as e:
+            status_code = e.response.status_code if hasattr(e, 'response') and e.response else "unknown"
+            logger.error(f"Error fetching KB article: {status_code} - {str(e)}")
+            
+            if status_code == 404:
+                return {"status": "not_found"}
+            
+            return {
+                "status": "error",
+                "message": f"Failed to fetch Knowledge Base article: {str(e)}"
+            }
+            
+        except Exception as e:
+            logger.error(f"Unexpected error fetching KB article: {str(e)}")
+            return {
+                "status": "error",
+                "message": f"Unexpected error occurred: {str(e)}"
+            }
 
 # Test the service if run directly
 if __name__ == "__main__":

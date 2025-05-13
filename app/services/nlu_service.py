@@ -23,7 +23,8 @@ INTENT_LABELS = [
     "find knowledge base article", 
     "create ticket", 
     "greeting", 
-    "general question"
+    "general question",
+    "request software"  # New intent for software requests
 ]
 
 # Map from model labels to internal intent names
@@ -33,7 +34,8 @@ INTENT_MAPPING = {
     "find knowledge base article": "find_kb_article",
     "create ticket": "create_ticket",
     "greeting": "greeting",
-    "general question": "general_question"
+    "general question": "general_question",
+    "request software": "request_software"  # New mapping for software requests
 }
 
 # Confidence threshold for intent classification
@@ -114,37 +116,62 @@ def extract_entities(text: str) -> Dict[str, List[str]]:
 
 def understand_intent(text: str) -> Dict[str, Any]:
     """
-    Extract the intent and entities from user text using zero-shot classification
-    and named entity recognition.
-    
-    This function uses the Hugging Face transformers library to:
-    1. Classify the user's input into one of the predefined intent categories
-    2. Extract named entities from the text
-    
-    NOTE: Standard NER models like the one used here recognize common entity types:
-    - PER: Person names
-    - ORG: Organization names
-    - LOC: Locations
-    - MISC: Miscellaneous entities
-    
-    They may not specifically recognize IT-specific entities like ticket numbers
-    (which might be classified as MISC or missed entirely). Custom fine-tuning
-    would be needed for domain-specific entity recognition.
+    理解用户意图并提取相关实体。结合零样本分类和命名实体识别。
     
     Args:
-        text: The user's message text
+        text: 用户输入的文本
         
     Returns:
-        A dictionary containing the detected intent, entities, and confidence score
-        Format: {"intent": str, "entities": Dict[str, List[str]], "confidence_score": float}
+        包含意图和实体的字典
     """
-    # Log the text being processed
-    logger.debug(f"Processing text for intent detection: {text}")
+    # 如果消息太短，不进行深度分析
+    if len(text.strip()) < 3:
+        return {"intent": "unknown", "entities": {}, "confidence_score": 0.0}
     
-    # Check if models were successfully loaded
-    if classifier is None:
-        logger.error("Classification model not available, returning unknown intent")
-        return {"intent": "unknown", "entities": {}, "confidence_score": None}
+    # 直接处理工单号查询，即使意图不明确
+    ticket_pattern = re.compile(r'\b(?:INC|REQ|TASK|RITM)\d{5,}\b', re.IGNORECASE)
+    ticket_matches = []
+    for match in ticket_pattern.finditer(text):
+        ticket_matches.append(match.group(0))  # 获取完整匹配
+    
+    # 如果文本中有明显的工单号，直接认为是工单查询意图
+    if ticket_matches and ("查" in text or "status" in text.lower() or "check" in text.lower() or "ticket" in text.lower()):
+        logger.info(f"直接识别为工单查询意图，工单号: {ticket_matches}")
+        entities = {"TICKET_NUMBER": ticket_matches}
+        return {
+            "intent": "check_ticket_status", 
+            "entities": entities, 
+            "confidence_score": 0.95  # 给予高置信度
+        }
+    
+    # 检查是否是知识库查询
+    kb_related = False
+    # 英文关键词
+    if "knowledge" in text.lower() or "article" in text.lower() or "guide" in text.lower() or "how to" in text.lower():
+        kb_related = True
+    # 中文关键词
+    if "知识" in text or "文章" in text or "指南" in text or "怎么" in text or "如何" in text:
+        kb_related = True
+    
+    # VPN是特殊关键词，直接视为知识库查询
+    if "vpn" in text.lower():
+        kb_related = True
+        
+    if kb_related:
+        # 提取知识库主题
+        kb_terms_pattern = re.compile(r'\b(vpn|servicenow|password|network|security|software|hardware|email|office|access|reset|setup|install|configure|troubleshoot|密码|网络|安全|软件|硬件|邮件|访问|重置|设置|安装|配置|故障)\b', re.IGNORECASE)
+        kb_matches = kb_terms_pattern.findall(text)
+        
+        entities = {}
+        if kb_matches:
+            entities["KB_TERMS"] = kb_matches
+            logger.info(f"检测到知识库查询意图，主题: {kb_matches}")
+            
+        return {
+            "intent": "find_kb_article", 
+            "entities": entities, 
+            "confidence_score": 0.9
+        }
     
     try:
         # Perform zero-shot classification for intent
@@ -167,9 +194,6 @@ def understand_intent(text: str) -> Dict[str, Any]:
         
         # Ticket pattern recognition for ServiceNow ticket numbers
         # This augments the NER model which might not specifically detect ticket numbers
-        ticket_pattern = re.compile(r'\b(INC|REQ|TASK|RITM)\d{5,}\b', re.IGNORECASE)
-        ticket_matches = ticket_pattern.findall(text)
-        
         if ticket_matches:
             # Check if these ticket numbers are already captured in any entity category
             existing_tickets = []
@@ -182,6 +206,79 @@ def understand_intent(text: str) -> Dict[str, Any]:
                 entities["TICKET_NUMBER"] = new_tickets
                 logger.debug(f"Found ticket references via pattern matching: {new_tickets}")
             
+            # 在ticket_pattern相关代码后添加：
+            logger.info(f"原始文本: '{text}'")
+            logger.info(f"正则表达式: {ticket_pattern.pattern}")
+            logger.info(f"提取的工单号: {ticket_matches}")
+            
+            # 如果检测到工单号但意图置信度低，强制设为工单查询意图
+            if intent == "unknown" and ticket_matches:
+                intent = "check_ticket_status"
+                logger.info(f"基于工单号强制设置意图为工单查询")
+        
+        # Knowledge base topic detection
+        # This helps identify IT-related topics for knowledge base searches
+        if intent == "find_kb_article" or "knowledge" in text.lower() or "article" in text.lower() or "guide" in text.lower() or "how to" in text.lower():
+            kb_terms_pattern = re.compile(r'\b(vpn|servicenow|password|network|security|software|hardware|email|office|access|reset|setup|install|configure|troubleshoot)\b(?:\s+\w+)?', re.IGNORECASE)
+            kb_matches = kb_terms_pattern.findall(text)
+            
+            if kb_matches:
+                kb_terms = []
+                for match in kb_matches:
+                    match = match.strip().title()
+                    if match and match not in kb_terms:
+                        kb_terms.append(match)
+                
+                if kb_terms:
+                    entities["KB_TERMS"] = kb_terms
+                    logger.debug(f"Found KB search terms: {kb_terms}")
+                    
+            # Log knowledge base search terms
+            logger.info(f"Knowledge base search text: '{text}'")
+            logger.info(f"Extracted KB terms: {kb_matches}")
+            
+            # Force intent to find_kb_article if knowledge terms are found but intent is low confidence
+            if kb_terms and intent == "unknown":
+                intent = "find_kb_article"
+                logger.info(f"Forcing intent to find_kb_article based on KB terms")
+        
+        # 中文关键词检测
+        if intent == "unknown":
+            # 检查中文关键词
+            if "查" in text or "票" in text or "工单" in text or "状态" in text:
+                intent = "check_ticket_status"
+                logger.info(f"基于中文关键词设置意图为工单查询")
+            elif "重置" in text or "密码" in text:
+                intent = "reset_password"
+                logger.info(f"基于中文关键词设置意图为密码重置")
+            elif "知识" in text or "文章" in text or "帮助" in text or "怎么" in text:
+                intent = "find_kb_article"
+                logger.info(f"基于中文关键词设置意图为知识库查询")
+            elif "申请" in text or "软件" in text or "安装" in text:
+                intent = "request_software"
+                logger.info(f"基于中文关键词设置意图为软件申请")
+            elif "创建" in text or "提交" in text or "报告" in text or "问题" in text:
+                intent = "create_ticket"
+                logger.info(f"基于中文关键词设置意图为创建工单")
+        
+        # Software name detection for software requests
+        # This is a simple pattern to catch common software mentions
+        if intent == "request_software" or "software" in text.lower() or "application" in text.lower() or "app" in text.lower():
+            software_pattern = re.compile(r'\b(microsoft|adobe|office|excel|word|powerpoint|photoshop|chrome|teams|zoom|slack|outlook|windows|mac os|ios|android|linux)\b(?:\s+\w+)?', re.IGNORECASE)
+            software_matches = software_pattern.findall(text)
+            
+            if software_matches:
+                # Clean up and standardize software names
+                software_names = []
+                for match in software_matches:
+                    match = match.strip().title()  # Standardize capitalization
+                    if match and match not in software_names:
+                        software_names.append(match)
+                
+                if software_names:
+                    entities["SOFTWARE_NAME"] = software_names
+                    logger.debug(f"Found software references: {software_names}")
+        
         # Log the final result
         if intent != "unknown":
             logger.info(f"Detected '{intent}' intent from: '{text}' with confidence: {top_score:.2f}")

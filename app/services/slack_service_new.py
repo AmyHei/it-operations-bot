@@ -3,16 +3,14 @@ Slack integration service using Slack Bolt for Python.
 """
 import logging
 import os
-import time
 from slack_bolt import App
 from slack_bolt.adapter.fastapi import SlackRequestHandler
 from app.config.settings import settings
 from app.services.nlu_service import understand_intent
 from app.services.dialogue_service import get_next_action
-from app.services.state_service import get_state, save_state, delete_state, save_conversation
+from app.services.state_service import get_state, save_state, delete_state
 from app.services.software_service import submit_software_request
 from app.services.knowledge_service import log_article_feedback
-from app.services.servicenow_service import ServiceNowService
 
 # Set up logging
 logging.basicConfig(
@@ -51,18 +49,6 @@ def create_slack_app():
             return
             
         try:
-            # 保存用户消息到Redis用于评估
-            user_message = {
-                "text": message_text,
-                "ts": message_ts or str(time.time()),
-                "user_id": user_id,
-                "channel_id": channel_id,
-                "thread_ts": thread_ts,
-                "type": "user_message"
-            }
-            save_conversation(user_id, channel_id, user_message)
-            logger.info(f"Saved user message to Redis for evaluation")
-            
             # 获取当前对话状态 - 使用Redis
             current_state = get_state(user_id, channel_id) or {}
             logger.info(f"Current state for user {user_id} in channel {channel_id}: {current_state}")
@@ -342,19 +328,6 @@ def create_slack_app():
                     thread_ts=reply_thread
                 )
             
-            # 保存机器人响应到Redis用于评估
-            bot_message = {
-                "text": response["response"],
-                "ts": str(time.time()),
-                "user_id": "bot",
-                "channel_id": channel_id,
-                "thread_ts": reply_thread,
-                "type": "bot_message",
-                "response_data": response
-            }
-            save_conversation(user_id, channel_id, bot_message)
-            logger.info(f"Saved bot response to Redis for evaluation")
-            
             # 更新对话状态 - 使用Redis
             if response.get("next_state") is not None:
                 # 保存对话状态，设置15分钟过期时间
@@ -379,25 +352,11 @@ def create_slack_app():
                 
         except Exception as e:
             logger.error(f"Error in process_and_respond: {str(e)}", exc_info=True)
-            error_response = "抱歉，处理您的请求时出现了错误。"
             slack_app.client.chat_postMessage(
                 channel=channel_id,
-                text=error_response,
+                text="抱歉，处理您的请求时出现了错误。",
                 thread_ts=thread_ts or message_ts
             )
-            
-            # 保存错误响应到Redis
-            error_message = {
-                "text": error_response,
-                "ts": str(time.time()),
-                "user_id": "bot",
-                "channel_id": channel_id,
-                "thread_ts": thread_ts or message_ts,
-                "type": "error_message",
-                "error": str(e)
-            }
-            save_conversation(user_id, channel_id, error_message)
-            logger.info(f"Saved error response to Redis for evaluation")
     
     # Add action handler for urgency selection dropdown
     @slack_app.action("select_ticket_urgency")
@@ -429,7 +388,7 @@ def create_slack_app():
             }
             
             # Call dialogue service with the selected option
-            result = handle_urgency_selection(intent_data, current_state, client) if "handle_urgency_selection" in globals() else get_next_action(intent_data, current_state)
+            result = handle_urgency_selection(intent_data, current_state) if "handle_urgency_selection" in globals() else get_next_action(intent_data, current_state)
             
             # Update the original message to show the selection
             client.chat_update(
@@ -439,362 +398,3 @@ def create_slack_app():
                 blocks=[
                     {
                         "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": f"✅ *Urgency selected*: {selected_text}"
-                        }
-                    }
-                ]
-            )
-            
-            # Send a follow-up message asking for details
-            client.chat_postMessage(
-                channel=channel_id,
-                text=result.get("response", "Please describe the issue you're experiencing in detail."),
-                thread_ts=message_ts
-            )
-            
-            # Update the conversation state
-            if result.get("next_state") is not None:
-                save_state(user_id, channel_id, result["next_state"], ttl_seconds=900)
-                logger.info(f"Updated state: {result['next_state']}")
-                delete_state(user_id, channel_id)
-        except Exception as e:
-            logger.error(f"Error handling urgency selection: {str(e)}", exc_info=True)
-            client.chat_postMessage(
-                channel=channel_id,
-                text="I encountered an error processing your selection. Please try again or create a ticket by describing your issue.",
-                thread_ts=message_ts
-            )
-    
-    # Add action handlers for password reset button clicks
-    @slack_app.action("confirm_password_reset_yes")
-    def handle_password_reset_yes(ack, body, client):
-        """Handle 'Yes' button click for password reset confirmation"""
-        # Acknowledge the action
-        ack()
-        
-        # Extract details from the interaction
-        user_id = body["user"]["id"]
-        channel_id = body["channel"]["id"]
-        message_ts = body["container"]["message_ts"]
-        
-        logger.info(f"User {user_id} confirmed password reset")
-        
-        try:
-            # Update the state
-            new_state = {"intent": "password_reset", "waiting_for": "employee_id"}
-            save_state(user_id, channel_id, new_state, ttl_seconds=900)
-            
-            # Send follow-up message
-            client.chat_postMessage(
-                channel=channel_id,
-                text="Great! Please provide your employee ID or username to proceed with the password reset.",
-                thread_ts=message_ts
-            )
-            
-            # Update the original message to show it's been acted upon
-            client.chat_update(
-                channel=channel_id,
-                ts=message_ts,
-                text="Password reset confirmed. Proceeding with the reset process.",
-                blocks=[
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": "✅ *Password Reset Initiated*\nPlease provide your employee ID or username."
-                        }
-                    }
-                ]
-            )
-        except Exception as e:
-            logger.error(f"Error handling password reset confirmation: {str(e)}", exc_info=True)
-            client.chat_postMessage(
-                channel=channel_id,
-                text="Sorry, there was an error processing your request. Please try again.",
-                thread_ts=message_ts
-            )
-    
-    @slack_app.action("confirm_password_reset_no")
-    def handle_password_reset_no(ack, body, client):
-        """Handle 'No' button click for password reset confirmation"""
-        # Acknowledge the action
-        ack()
-        
-        # Extract details from the interaction
-        user_id = body["user"]["id"]
-        channel_id = body["channel"]["id"]
-        message_ts = body["container"]["message_ts"]
-        
-        logger.info(f"User {user_id} declined password reset")
-        
-        try:
-            # Clear the state
-            delete_state(user_id, channel_id)
-            
-            # Send follow-up message
-            client.chat_postMessage(
-                channel=channel_id,
-                text="I've cancelled the password reset. Is there anything else I can help you with?",
-                thread_ts=message_ts
-            )
-            
-            # Update the original message to show it's been acted upon
-            client.chat_update(
-                channel=channel_id,
-                ts=message_ts,
-                text="Password reset cancelled.",
-                blocks=[
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": "❌ *Password Reset Cancelled*\nNo action has been taken."
-                        }
-                    }
-                ]
-            )
-        except Exception as e:
-            logger.error(f"Error handling password reset cancellation: {str(e)}", exc_info=True)
-            client.chat_postMessage(
-                channel=channel_id,
-                text="Sorry, there was an error processing your request. Please try again.",
-                thread_ts=message_ts
-            )
-    
-    # Add action handlers for KB article feedback
-    @slack_app.action("kb_feedback_helpful")
-    def handle_kb_feedback_helpful(ack, body, client):
-        """Handle helpful feedback for KB articles"""
-        # Acknowledge the action
-        ack()
-        
-        # Extract details from the interaction
-        user_id = body["user"]["id"]
-        channel_id = body["channel"]["id"]
-        message_ts = body["container"]["message_ts"]
-        article_id = body["actions"][0]["value"]
-        
-        logger.info(f"User {user_id} found article {article_id} helpful")
-        
-        try:
-            # Log the feedback
-            log_article_feedback(article_id, "helpful", user_id)
-            
-            # 准备响应消息
-            response_text = f"Thank you for your feedback! I'm glad the article was helpful."
-            
-            # Send a confirmation message
-            client.chat_postMessage(
-                channel=channel_id,
-                text=response_text,
-                thread_ts=message_ts
-            )
-            
-            # 保存交互操作到Redis用于评估
-            interaction = {
-                "text": f"User rated article {article_id} as helpful",
-                "ts": str(time.time()),
-                "user_id": user_id,
-                "channel_id": channel_id,
-                "thread_ts": message_ts,
-                "type": "interaction",
-                "interaction_type": "kb_feedback",
-                "value": "helpful",
-                "article_id": article_id
-            }
-            save_conversation(user_id, channel_id, interaction)
-            
-            # 保存机器人响应到Redis
-            bot_response = {
-                "text": response_text,
-                "ts": str(time.time()),
-                "user_id": "bot",
-                "channel_id": channel_id,
-                "thread_ts": message_ts,
-                "type": "bot_message"
-            }
-            save_conversation(user_id, channel_id, bot_response)
-            logger.info(f"Saved feedback interaction and response to Redis for evaluation")
-            
-            # Note: We need to update the specific button section, not the entire message
-            # This would require more complex handling and knowledge of the message structure
-            # For simplicity, we'll just add a new message confirming receipt of feedback
-        except Exception as e:
-            logger.error(f"Error logging helpful feedback: {str(e)}", exc_info=True)
-            error_message = "There was an error recording your feedback, but thank you for letting us know the article was helpful."
-            client.chat_postMessage(
-                channel=channel_id,
-                text=error_message,
-                thread_ts=message_ts
-            )
-            
-            # 保存错误响应到Redis
-            error_response = {
-                "text": error_message,
-                "ts": str(time.time()),
-                "user_id": "bot",
-                "channel_id": channel_id,
-                "thread_ts": message_ts,
-                "type": "error_message",
-                "error": str(e)
-            }
-            save_conversation(user_id, channel_id, error_response)
-    
-    @slack_app.action("kb_feedback_unhelpful")
-    def handle_kb_feedback_unhelpful(ack, body, client):
-        """Handle unhelpful feedback for KB articles"""
-        # Acknowledge the action
-        ack()
-        
-        # Extract details from the interaction
-        user_id = body["user"]["id"]
-        channel_id = body["channel"]["id"]
-        message_ts = body["container"]["message_ts"]
-        article_id = body["actions"][0]["value"]
-        
-        logger.info(f"User {user_id} found article {article_id} unhelpful")
-        
-        try:
-            # Log the feedback
-            log_article_feedback(article_id, "unhelpful", user_id)
-            
-            # 准备响应消息
-            response_text = f"Thank you for your feedback. I'm sorry the article wasn't helpful. Would you like to create a support ticket instead?"
-            
-            # Send a confirmation message with next steps
-            client.chat_postMessage(
-                channel=channel_id,
-                text=response_text,
-                thread_ts=message_ts
-            )
-            
-            # 保存交互操作到Redis用于评估
-            interaction = {
-                "text": f"User rated article {article_id} as unhelpful",
-                "ts": str(time.time()),
-                "user_id": user_id,
-                "channel_id": channel_id,
-                "thread_ts": message_ts,
-                "type": "interaction",
-                "interaction_type": "kb_feedback",
-                "value": "unhelpful",
-                "article_id": article_id
-            }
-            save_conversation(user_id, channel_id, interaction)
-            
-            # 保存机器人响应到Redis
-            bot_response = {
-                "text": response_text,
-                "ts": str(time.time()),
-                "user_id": "bot",
-                "channel_id": channel_id,
-                "thread_ts": message_ts,
-                "type": "bot_message"
-            }
-            save_conversation(user_id, channel_id, bot_response)
-            logger.info(f"Saved feedback interaction and response to Redis for evaluation")
-            
-            # Similar note about updating buttons applies here
-        except Exception as e:
-            logger.error(f"Error logging unhelpful feedback: {str(e)}", exc_info=True)
-            error_message = "There was an error recording your feedback, but I understand the article wasn't helpful. Would you like to try a different search or create a support ticket?"
-            client.chat_postMessage(
-                channel=channel_id,
-                text=error_message,
-                thread_ts=message_ts
-            )
-            
-            # 保存错误响应到Redis
-            error_response = {
-                "text": error_message,
-                "ts": str(time.time()),
-                "user_id": "bot",
-                "channel_id": channel_id,
-                "thread_ts": message_ts,
-                "type": "error_message",
-                "error": str(e)
-            }
-            save_conversation(user_id, channel_id, error_response)
-    
-    @slack_app.event("app_mention")
-    def handle_app_mention(event, say):
-        """处理 app_mention 事件"""
-        logger.debug(f"Received app_mention event: {event}")
-        try:
-            # 提取消息信息
-            bot_id = event.get("authorizations", [{}])[0].get("user_id", "")
-            message_text = event.get("text", "").replace(f"<@{bot_id}>", "").strip()
-            user_id = event.get("user")
-            channel_id = event.get("channel")
-            thread_ts = event.get("thread_ts")
-            message_ts = event.get("ts")
-            
-            logger.info(f"Processing app_mention - User: {user_id}, Channel: {channel_id}, Message: {message_text}")
-            logger.info(f"Thread TS: {thread_ts}, Message TS: {message_ts}")
-            
-            process_and_respond(message_text, user_id, channel_id, thread_ts, message_ts)
-            
-        except Exception as e:
-            logger.error(f"Error in handle_app_mention: {str(e)}", exc_info=True)
-            say("抱歉，处理您的请求时出现了错误。")
-    
-    @slack_app.event("message")
-    def handle_message(event, say):
-        """处理普通消息事件"""
-        logger.debug(f"Received message event: {event}")
-        
-        if event.get("user") and not event.get("bot_id"):
-            channel_type = event.get("channel_type")
-            thread_ts = event.get("thread_ts")
-            message_ts = event.get("ts")
-            user_id = event.get("user")
-            channel_id = event.get("channel")
-            message_text = event.get("text", "").strip()
-            
-            logger.info(f"Processing message - Type: {channel_type}, User: {user_id}, Channel: {channel_id}")
-            logger.info(f"Thread TS: {thread_ts}, Message TS: {message_ts}, Text: {message_text}")
-            
-            # Check if this is a thread we should respond to
-            should_respond = (
-                channel_type == "im" or
-                (thread_ts and thread_ts in active_threads) or
-                (message_ts and message_ts in active_threads)
-            )
-            
-            logger.info(f"Should respond: {should_respond}")
-            logger.info(f"Active threads: {active_threads}")
-            
-            if should_respond:
-                process_and_respond(message_text, user_id, channel_id, thread_ts, message_ts)
-    
-    return slack_app
-
-def process_message(message_text: str, user_id: str, current_state: dict = None) -> dict:
-    """处理消息并返回响应"""
-    try:
-        # 如果正在等待工单号且消息包含工单号格式
-        if current_state and current_state.get("waiting_for") == "ticket_number" and "INC" in message_text:
-            dialogue_result = get_next_action({"intent": "check_ticket", "ticket_number": message_text}, current_state)
-        else:
-            # 正常的 NLU 处理流程
-            intent_data = understand_intent(message_text)
-            intent_data["text"] = message_text
-            dialogue_result = get_next_action(intent_data, current_state)
-        
-        return dialogue_result
-    except Exception as e:
-        logger.error(f"Error in process_message: {str(e)}", exc_info=True)
-        return {
-            "response": "抱歉，处理您的请求时出现了错误。",
-            "next_state": None
-        }
-
-# Create an instance of the Slack app
-slack_app = create_slack_app()
-
-# Create a request handler for FastAPI integration
-slack_handler = SlackRequestHandler(slack_app) 
-
-snow = ServiceNowService() 

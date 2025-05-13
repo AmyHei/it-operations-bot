@@ -9,4 +9,12 @@ transformers==4.40.1
 torch==2.2.1
 requests==2.31.0
 redis==5.0.1
+openai==1.12.0
+beautifulsoup4==4.12.3
+botbuilder-core
+botbuilder-schema
+aiohttp
+sentence-transformers
+chromadb
+pysnow
 
