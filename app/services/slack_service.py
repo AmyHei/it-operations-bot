@@ -12,6 +12,7 @@ from app.services.dialogue_service import get_next_action
 from app.services.state_service import get_state, save_state, delete_state, save_conversation
 from app.services.software_service import submit_software_request
 from app.services.knowledge_service import log_article_feedback
+from app.services.servicenow_service import ServiceNowService
 
 # Set up logging
 logging.basicConfig(
@@ -795,3 +796,5 @@ slack_app = create_slack_app()
 
 # Create a request handler for FastAPI integration
 slack_handler = SlackRequestHandler(slack_app) 
+
+snow = ServiceNowService() 

@@ -7,8 +7,8 @@ from dotenv import load_dotenv
 
 # Import services
 sys.path.append('.')
-from app.services.nlu_service import analyze_intent
-from app.services.dialogue_service import get_response
+from app.services.nlu_service import understand_intent
+from app.services.dialogue_service import handle_message
 from app.services.state_service import get_state, save_state, delete_state
 
 # Configure logging
@@ -31,7 +31,7 @@ def simulate_conversation():
     thread_ts = "T_TEST_THREAD"
     
     # Check if state already exists for this user
-    current_state = get_state(user_id, channel_id, thread_ts)
+    current_state = get_state(user_id, channel_id)
     
     if current_state:
         logger.info(f"Found existing state for user {user_id}:")

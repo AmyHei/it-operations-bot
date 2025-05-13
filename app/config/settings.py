@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     SLACK_SIGNING_SECRET: str = os.getenv("SLACK_SIGNING_SECRET", "")
     SLACK_APP_TOKEN: str = os.getenv("SLACK_APP_TOKEN", "")
     
+    # Microsoft Teams Bot credentials
+    MICROSOFT_APP_ID: str = os.getenv("MICROSOFT_APP_ID", "")
+    MICROSOFT_APP_PASSWORD: str = os.getenv("MICROSOFT_APP_PASSWORD", "")
+    
     class Config:
         env_file = ".env"
         case_sensitive = True

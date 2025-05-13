@@ -6,8 +6,11 @@ the user's intent and the current conversation state.
 """
 from typing import Dict, Optional, Any
 from app.services.servicenow_service import ServiceNowService, create_servicenow_ticket
-from app.services.knowledge_service import search_knowledge_base
+from app.services.knowledge_service import KnowledgeService
+from app.services.llm_service import generate_kb_response, clean_article_content
 import logging
+import re
+import os
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -15,96 +18,172 @@ logger = logging.getLogger(__name__)
 # Initialize ServiceNow service
 servicenow = ServiceNowService()
 
-def get_next_action(intent_data: Dict[str, Any], current_state: Optional[Dict] = None) -> Dict[str, Any]:
+# Initialize Knowledge Service with local KB directory
+knowledge_service = KnowledgeService(local_kb_directory="./local_kb_docs/")
+
+# Get ServiceNow instance URL for KB article links
+SERVICENOW_INSTANCE = os.getenv('SERVICENOW_INSTANCE')
+
+# 检测文本是否包含中文
+def contains_chinese(text: str) -> bool:
+    """检测文本是否包含中文字符"""
+    for char in text:
+        if '\u4e00' <= char <= '\u9fff':
+            return True
+    return False
+
+# 根据用户输入语言选择响应模板
+def get_response_by_language(text: str, zh_response: str, en_response: str) -> str:
+    """根据输入文本选择中文或英文响应"""
+    if contains_chinese(text):
+        return zh_response
+    return en_response
+
+def get_next_action(intent_data: Dict, current_state: Optional[Dict] = None) -> Dict:
     """
-    Determines the next action based on the intent from NLU service and current conversation state.
-    
-    Args:
-        intent_data: Output from nlu_service.understand_intent containing intent and entity information
-        current_state: Current conversation state retrieved from Redis
-        
-    Returns:
-        Dict containing:
-            - action: The type of action to take
-            - response: The text response to send to the user
-            - next_state: The updated conversation state to be saved in Redis, or None to clear the state
+    Determine the next action based on intent and current state.
+    Returns response text and next state.
     """
-    logger.info(f"Processing intent data: {intent_data}")
-    logger.info(f"Current conversation state: {current_state}")
-    
-    # Initialize empty state if None is provided
-    if current_state is None:
-        current_state = {}
-    
-    # Handle specific conversation states first
-    if current_state.get("waiting_for") == "ticket_number":
-        # User is providing a ticket number
-        return handle_ticket_number_input(intent_data, current_state)
-    
-    elif current_state.get("waiting_for") == "ticket_details":
-        # User is providing details for creating a ticket
-        return handle_ticket_details_input(intent_data, current_state)
-    
-    elif current_state.get("waiting_for") == "confirmation":
-        # User is confirming or rejecting an action
-        return handle_confirmation_input(intent_data, current_state)
-    
-    elif current_state.get("waiting_for") == "urgency_selection":
-        # User has selected an urgency level
-        return handle_urgency_selection(intent_data, current_state)
-    
-    elif current_state.get("waiting_for") == "software_name":
-        # User is providing software name
-        return handle_software_name_input(intent_data, current_state)
-    
-    elif current_state.get("waiting_for") == "software_confirmation":
-        # User is confirming software request
-        return handle_software_confirmation_input(intent_data, current_state)
+    try:
+        # Get the text from intent data
+        text = intent_data.get("text", "")
         
-    # If not in a specific state, process based on the detected intent
-    intent = intent_data.get("intent", "unknown")
-    entities = intent_data.get("entities", {})
-    confidence = intent_data.get("confidence_score", 0)
-    
-    logger.info(f"Processing intent: {intent} with confidence: {confidence}")
-    logger.info(f"Entities: {entities}")
-    
-    # Handle each intent
-    if intent == "check_ticket_status":
-        return handle_check_ticket_status(intent_data, entities)
+        # Check if input contains Chinese
+        use_chinese = contains_chinese(text)
+        logger.info(f" 用户输入包含中文: {use_chinese}")
         
-    elif intent == "reset_password":
-        return handle_reset_password(intent_data)
+        # Log the intent processing
+        intent = intent_data.get("intent", "unknown")
+        confidence = intent_data.get("confidence_score", 0)
+        entities = intent_data.get("entities", {})
+        logger.info(f"Processing intent: {intent} with confidence: {confidence}")
+        logger.info(f"Entities: {entities}")
         
-    elif intent == "find_kb_article":
-        return handle_find_kb_article(intent_data, entities)
+        # Handle KB query state - user has asked to search KB and is now providing the query
+        if current_state and current_state.get("waiting_for") == "kb_query":
+            # User is providing a KB search query
+            logger.info(f"Processing KB query: {text}")
+            try:
+                # Use the new KnowledgeService to get an answer
+                answer = knowledge_service.get_answer_from_kb(text)
+                
+                return {
+                    "action": "provide_kb_answer",
+                    "response": answer,
+                    "next_state": None  # End the KB query flow
+                }
+            except Exception as e:
+                logger.error(f"Error getting KB answer: {str(e)}", exc_info=True)
+                return {
+                    "response": "抱歉，搜索知识库时出现错误。请稍后再试。" if use_chinese else 
+                               "Sorry, there was an error searching the knowledge base. Please try again later.",
+                    "next_state": None
+                }
         
-    elif intent == "create_ticket":
-        return handle_create_ticket(intent_data, entities)
-    
-    elif intent == "request_software":
-        return handle_request_software(intent_data, entities)
+        # Handle specific conversation states first
+        if current_state.get("waiting_for") == "ticket_number":
+            # User is providing a ticket number
+            return handle_ticket_number_input(intent_data, current_state)
         
-    elif intent == "greeting":
+        elif current_state.get("waiting_for") == "ticket_details":
+            # User is providing details for creating a ticket
+            return handle_ticket_details_input(intent_data, current_state)
+        
+        elif current_state.get("waiting_for") == "confirmation":
+            # User is confirming or rejecting an action
+            return handle_confirmation_input(intent_data, current_state)
+        
+        elif current_state.get("waiting_for") == "urgency_selection":
+            # User has selected an urgency level
+            return handle_urgency_selection(intent_data, current_state)
+        
+        elif current_state.get("waiting_for") == "software_name":
+            # User is providing software name
+            return handle_software_name_input(intent_data, current_state)
+        
+        elif current_state.get("waiting_for") == "software_confirmation":
+            # User is confirming software request
+            return handle_software_confirmation_input(intent_data, current_state)
+        
+        # If not in a specific state, process based on the detected intent
+        intent = intent_data.get("intent", "unknown")
+        entities = intent_data.get("entities", {})
+        confidence = intent_data.get("confidence_score", 0)
+        
+        logger.info(f"Processing intent: {intent} with confidence: {confidence}")
+        logger.info(f"Entities: {entities}")
+        
+        # Handle each intent
+        if intent == "check_ticket_status":
+            return handle_check_ticket_status(intent_data, entities)
+        
+        elif intent == "reset_password":
+            return handle_reset_password(intent_data)
+        
+        elif intent == "create_ticket":
+            return handle_create_ticket(intent_data, entities)
+        
+        elif intent == "request_software":
+            return handle_request_software(intent_data, entities)
+        
+        elif intent == "greeting":
+            # 根据用户语言选择响应
+            if use_chinese:
+                response = "您好！我是IT支持助手。今天有什么可以帮您的吗？"
+            else:
+                response = "Hello! I'm your IT support assistant. How can I help you today?"
+            
+            return {
+                "action": "greeting",
+                "response": response,
+                "next_state": None
+            }
+        
+        elif intent == "general_question":
+            # 根据用户语言选择响应
+            if use_chinese:
+                response = "我可以帮助解决IT相关问题。我可以查询工单状态、帮助重置密码、查找知识库文章、创建新的支持工单或请求软件。您需要什么帮助？"
+            else:
+                response = "I can help with IT-related questions. I can check ticket status, help reset passwords, find knowledge base articles, create new support tickets, or request software. What would you like assistance with?"
+            
+            return {
+                "action": "respond_general",
+                "response": response,
+                "next_state": None
+            }
+        
+        # Handle find_kb_article intent differently now
+        if intent == "find_kb_article":
+            logger.info("Handling find_kb_article intent - asking for query")
+            
+            # Instead of immediately searching, set up the state to wait for query
+            response = "请问您想查询什么IT相关问题？" if use_chinese else "What IT-related question would you like me to answer?"
+            
+            return {
+                "action": "ask_kb_query",
+                "response": response,
+                "next_state": {"waiting_for": "kb_query"}  # Set state to wait for KB query
+            }
+        
+        # Default response for unknown intent
+        if use_chinese:
+            response = "抱歉，我不太理解您的意思。我可以帮助查询工单状态、重置密码、查找知识库文章、创建支持工单或请求软件。您能重新描述您的请求吗？"
+        else:
+            response = "I'm not sure I understand. I can help with checking ticket status, resetting passwords, finding knowledge base articles, creating support tickets, or requesting software. Could you please rephrase your request?"
+        
         return {
-            "action": "greeting",
-            "response": "Hello! I'm your IT support assistant. How can I help you today?",
+            "action": "clarify",
+            "response": response,
             "next_state": None
         }
-        
-    elif intent == "general_question":
+
+    except Exception as e:
+        logger.error(f"Error in get_next_action: {str(e)}", exc_info=True)
         return {
-            "action": "respond_general",
-            "response": "I can help with IT-related questions. I can check ticket status, help reset passwords, find knowledge base articles, create new support tickets, or request software. What would you like assistance with?",
+            "response": "抱歉，处理您的请求时出现错误。" if use_chinese else
+                       "Sorry, there was an error processing your request.",
             "next_state": None
         }
-    
-    # Default response for unknown intent
-    return {
-        "action": "clarify",
-        "response": "I'm not sure I understand. I can help with checking ticket status, resetting passwords, finding knowledge base articles, creating support tickets, or requesting software. Could you please rephrase your request?",
-        "next_state": None
-    }
 
 def handle_ticket_number_input(intent_data: Dict[str, Any], current_state: Dict[str, Any]) -> Dict[str, Any]:
     """Handle user providing a ticket number"""
@@ -335,56 +414,6 @@ def handle_reset_password(intent_data: Dict[str, Any]) -> Dict[str, Any]:
         "next_state": {"waiting_for": "confirmation", "action_type": "password_reset"}
     }
 
-def handle_find_kb_article(intent_data: Dict[str, Any], entities: Dict[str, Any]) -> Dict[str, Any]:
-    """Handle find knowledge base article intent"""
-    # Extract topics from entities if available
-    topics = []
-    
-    if "MISC" in entities:
-        topics.extend(entities["MISC"])
-    if "ORG" in entities:
-        topics.extend(entities["ORG"])
-    
-    if topics:
-        topics_str = ", ".join(topics)
-        
-        # Search for articles using the knowledge service
-        query = topics_str
-        try:
-            articles = search_knowledge_base(query, max_results=3)
-            
-            if articles:
-                return {
-                    "action": "display_kb_articles",
-                    "response": f"Here are some articles about {topics_str}:",
-                    "response_type": "blocks",
-                    "blocks_config": {
-                        "type": "kb_results",
-                        "articles": articles,
-                        "query": query
-                    },
-                    "next_state": None
-                }
-            else:
-                return {
-                    "action": "no_kb_results",
-                    "response": f"I couldn't find any articles about {topics_str}. Please try a different search term or consider creating a support ticket.",
-                    "next_state": None
-                }
-        except Exception as e:
-            logger.error(f"Error searching knowledge base: {str(e)}")
-            return {
-                "action": "error",
-                "response": "I'm sorry, I encountered an error while searching the knowledge base. Please try again later.",
-                "next_state": None
-            }
-    else:
-        return {
-            "action": "ask_topic",
-            "response": "I can help you find knowledge base articles. What topic are you interested in?",
-            "next_state": {"waiting_for": "kb_topic", "action_type": "find_kb"}
-        }
-
 def handle_create_ticket(intent_data: Dict[str, Any], entities: Dict[str, Any]) -> Dict[str, Any]:
     """Handle create ticket intent"""
     # Extract issue description if present
@@ -540,8 +569,19 @@ def handle_message(message_text: str, current_state: Optional[Dict] = None) -> D
     # If no specific state, handle based on intent
     intent = "unknown"
     
-    if "INC" in message_text:
+    # 提取工单号，即使NLU没能提取到
+    ticket_pattern = re.compile(r'\b(?:INC|REQ|TASK|RITM)\d{5,}\b', re.IGNORECASE)
+    ticket_matches = []
+    for match in ticket_pattern.finditer(message_text):
+        ticket_matches.append(match.group(0))
+    
+    # 检测是否包含中文
+    use_chinese = contains_chinese(message_text)
+    
+    # 英文关键词检测
+    if "INC" in message_text or any(ticket_matches):
         intent = "check_ticket_status"
+        logger.info(f"检测到工单查询意图，工单号: {ticket_matches}")
     elif "reset" in message_text.lower():
         intent = "reset_password"
     elif "knowledge" in message_text.lower():
@@ -549,11 +589,68 @@ def handle_message(message_text: str, current_state: Optional[Dict] = None) -> D
     elif "software" in message_text.lower() or "install" in message_text.lower():
         intent = "request_software"
     
+    # 中文关键词检测
+    elif "查" in message_text or "票" in message_text or "工单" in message_text or "状态" in message_text:
+        intent = "check_ticket_status"
+        logger.info(f"检测到中文工单查询意图: '{message_text}'")
+    elif "重置" in message_text or "密码" in message_text:
+        intent = "reset_password"
+        logger.info(f"检测到中文密码重置意图: '{message_text}'")
+    elif "知识" in message_text or "文章" in message_text or "帮助" in message_text or "怎么" in message_text:
+        intent = "find_kb_article"
+        logger.info(f"检测到中文知识库查询意图: '{message_text}'")
+    elif "申请" in message_text or "软件" in message_text or "安装" in message_text:
+        intent = "request_software"
+        logger.info(f"检测到中文软件申请意图: '{message_text}'")
+    elif "创建" in message_text or "提交" in message_text or "报告" in message_text or "问题" in message_text:
+        intent = "create_ticket"
+        logger.info(f"检测到中文创建工单意图: '{message_text}'")
+    elif "vpn" in message_text.lower():
+        # 特别处理VPN相关查询
+        intent = "find_kb_article"
+        
+        # 根据用户语言选择回复语言
+        title = "VPN访问ServiceNow的方法" if use_chinese else "VPN Access to ServiceNow"
+        summary = "通过VPN连接访问ServiceNow实例的指南" if use_chinese else "Instructions for accessing ServiceNow instances through VPN connection"
+        category = "网络" if use_chinese else "Network"
+        response_text = "以下是关于VPN的文章:" if use_chinese else "Here are some articles about VPN:"
+        
+        return {
+            "action": "display_kb_articles",
+            "response": response_text,
+            "response_type": "blocks",
+            "blocks_config": {
+                "type": "kb_results",
+                "articles": [
+                    {
+                        "id": "KB00006",
+                        "title": title,
+                        "url": "https://example.com/kb/servicenow-vpn-access",
+                        "summary": summary,
+                        "category": category
+                    }
+                ],
+                "query": "VPN, ServiceNow"
+            },
+            "next_state": None
+        }
+    
     if intent != "unknown":
-        return get_next_action({"intent": intent, "text": message_text})
+        # 如果检测到了特定的意图，为entities添加任何已经找到的工单号
+        intent_data = {"intent": intent, "text": message_text}
+        if ticket_matches and intent == "check_ticket_status":
+            intent_data["entities"] = {"TICKET_NUMBER": ticket_matches}
+        
+        return get_next_action(intent_data)
     else:
+        # 根据用户语言选择回复语言
+        if use_chinese:
+            response = "抱歉，我不太理解您的意思。您可以尝试询问工单状态、重置密码、查找知识库文章、创建工单或申请软件。"
+        else:
+            response = "Sorry, I didn't understand that. You can ask about ticket status, password reset, knowledge base articles, create tickets, or request software."
+            
         return {
             "action": "clarify",
-            "response": "Sorry, I didn't understand that. Can you please rephrase?",
+            "response": response,
             "next_state": None
         } 
